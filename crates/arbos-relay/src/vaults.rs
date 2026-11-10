@@ -103,13 +103,6 @@ pub(crate) fn vault_connect() -> bool {
     provider_enabled() && connect_enabled()
 }
 
-/// Remote feature flags the apps read (`GET /secrets` and `GET /me` → `features`): the one
-/// object from `crate::features`, so every flag ships on both endpoints.
-#[allow(dead_code)] // kept as the documented alias; handlers use `crate::features::dto()`.
-pub(crate) fn features() -> Value {
-    crate::features::features()
-}
-
 fn cache_ttl() -> Duration {
     Duration::from_secs(env_u64("ARBOS_OP_CACHE_TTL_SECS", 300))
 }
@@ -597,11 +590,6 @@ pub(crate) fn access_dto(state: &AppState, a: &Access) -> SecretAccessDto {
     }
 }
 
-#[allow(dead_code)] // Value form of [`access_dto`].
-fn access_json(state: &AppState, a: &Access) -> Value {
-    to_json(access_dto(state, a))
-}
-
 /// `GET /secrets` → `vaults[]`.
 pub(crate) fn list_dto(state: &AppState, user_id: &str) -> Vec<VaultDto> {
     state
@@ -611,11 +599,6 @@ pub(crate) fn list_dto(state: &AppState, user_id: &str) -> Vec<VaultDto> {
         .iter()
         .map(|v| vault_dto(state, v))
         .collect()
-}
-
-#[allow(dead_code)] // Value form for callers that still want raw JSON arrays.
-pub(crate) fn list_json(state: &AppState, user_id: &str) -> Vec<Value> {
-    list_dto(state, user_id).into_iter().map(to_json).collect()
 }
 
 /// One vault-level access as an item of the agent profile page.
@@ -649,11 +632,6 @@ pub(crate) fn access_item_dto(
             status: v.status,
         }),
     })
-}
-
-#[allow(dead_code)] // Value form of [`access_item_dto`].
-pub(crate) fn access_item_json(state: &AppState, owner: &str, a: &Access) -> Option<Value> {
-    access_item_dto(state, owner, a).map(to_json)
 }
 
 /// Items of connected vaults this project may use (names only), one per cached item.
@@ -1437,8 +1415,8 @@ fn short_ref(reference: &str) -> String {
         .unwrap_or_else(|| reference.to_owned())
 }
 
-/// After an allowed use: spend a one-time grant, pin the first host, audit.
-pub(crate) fn after_op_use(
+/// Admit a prepared sensitive use before its effect: claim once, pin the host and audit.
+pub(crate) fn admit_op_use(
     state: &AppState,
     reference: &str,
     project_id: &str,
@@ -1446,9 +1424,31 @@ pub(crate) fn after_op_use(
     use_kind: &str,
     chat_id: Option<&str>,
     allowed: &OpAllowed,
-) {
-    if let Some(once) = &allowed.once {
-        let _ = state.db.consume_allowed_once(&once.id);
+) -> Result<crate::secrets::UseReceipt, ApiErr> {
+    let receipt = crate::secrets::claim_use(state, allowed.once.as_ref())?;
+    note_op_use(
+        state, reference, project_id, host, use_kind, chat_id, allowed, &receipt,
+    )?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_op_use(
+    state: &AppState,
+    reference: &str,
+    project_id: &str,
+    host: &str,
+    use_kind: &str,
+    chat_id: Option<&str>,
+    allowed: &OpAllowed,
+    receipt: &crate::secrets::UseReceipt,
+) -> Result<(), ApiErr> {
+    if !receipt.permits(allowed.once.as_ref()) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "not_allowed",
+            "operation has no matching one-time authorization",
+        ));
     }
     let v = &allowed.vault;
     if allowed.pin_host {
@@ -1506,6 +1506,7 @@ pub(crate) fn after_op_use(
             ..entry("used", v, &format!("agent:{project_id}"))
         },
     );
+    Ok(())
 }
 
 fn audit_op_refusal(
@@ -1538,7 +1539,7 @@ fn audit_op_refusal(
 }
 
 /// `/egress` step for `op://` references: `(reference → value)` to substitute, refusals, values
-/// to redact, and the uses to settle after the request goes out.
+/// to redact, and the uses to admit after local validation and before the request goes out.
 pub(crate) struct OpPlan {
     pub values: Vec<(String, String)>,
     pub refused: Vec<(String, String)>,
@@ -1646,9 +1647,9 @@ pub(crate) async fn box_request(
                 };
                 state.db.insert_secret_request(&rq).map_err(internal)?;
                 if allowed.pin_host {
-                    after_op_use(
+                    admit_op_use(
                         state, reference, project_id, &host_s, use_kind, chat, &allowed,
-                    );
+                    )?;
                 }
                 return Ok(Json(json!({ "request": request_json(state, &rq), "status": "allowed_always", "access_id": a.id })).into_response());
             }

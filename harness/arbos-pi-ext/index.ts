@@ -20,6 +20,9 @@ import { Type } from "typebox";
 import { DENY_RULES, matchDeny } from "./deny.ts";
 import { ROUTE_PARAMS, type RouteArgs } from "./route-schema.ts";
 import { describeWidget, WIDGET_PARAM } from "./widget-schema.ts";
+import { stopJobText, type StopJobResult } from "./stop-job-text.ts";
+
+export { stopJobText, type StopJobResult } from "./stop-job-text.ts";
 
 const STATE_DIR = process.env.ARBOS_STATE_DIR ?? join(process.env.HOME ?? "/tmp", ".arbos");
 const AUDIT_PATH = process.env.ARBOS_AUDIT_PATH ?? join(STATE_DIR, "audit.jsonl");
@@ -39,6 +42,14 @@ const STEER_PREFIX = "[Arbos steer:";
 // result, an approval outcome, an agent's reply) — turns whose only valid route is `reply`.
 const RELAY_TURN_MARK = "[Arbos relay turn]";
 
+const DETACHED_SHELL_PATTERNS: readonly RegExp[] = [
+  /(^|[;&|(`'"]\s*|\bsudo\s+|\bexec\s+)(nohup|setsid)\b/m,
+  /\bdisown\b/,
+  /\b(tmux\s+new(-session)?|screen\s+-[dD]|systemd-run|start-stop-daemon|at\s+now)\b/,
+  // `cmd &` / `(cmd) &` / `cmd & disown` / `cmd &\n…` — not `&&`, not `2>&1`, not `&>`.
+  /(?<![&<>|\d])&(?![&>])\s*(?:$|[;)\n]|\n|disown\b|\\n)/m,
+];
+
 /**
  * A shell command that would outlive the turn (nohup / setsid / disown / a trailing `&` / tmux /
  * screen / systemd-run) in the main agent's own turn. That work is a job: `start_job` runs it on a
@@ -52,14 +63,7 @@ export function detachedShell(toolName: string, input: Record<string, unknown>):
     : toolName === "codemode" ? String(input?.code ?? "")
     : "";
   if (!text) return null;
-  const patterns: RegExp[] = [
-    /(^|[;&|(`'"]\s*|\bsudo\s+|\bexec\s+)(nohup|setsid)\b/m,
-    /\bdisown\b/,
-    /\b(tmux\s+new(-session)?|screen\s+-[dD]|systemd-run|start-stop-daemon|at\s+now)\b/,
-    // `cmd &` / `(cmd) &` / `cmd & disown` / `cmd &\n…` — not `&&`, not `2>&1`, not `&>`.
-    /(?<![&<>|\d])&(?![&>])\s*(?:$|[;)\n]|\n|disown\b|\\n)/m,
-  ];
-  for (const re of patterns) {
+  for (const re of DETACHED_SHELL_PATTERNS) {
     const m = re.exec(text);
     if (m) return text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 40).replace(/\s+/g, " ").trim();
   }
@@ -107,78 +111,6 @@ export function promisesMore(text: string): boolean {
     || /\bbelow\b/.test(t) && t.length < 160;
 }
 
-/** What `Agent::hook_stop_job` answers with, as the fields this renderer must not lose. */
-export type StopJobResult = {
-  stopped?: {
-    job_id?: string;
-    title?: string;
-    state?: string;
-    processes_checked?: boolean;
-    processes_killed?: number;
-    processes_still_alive?: number[];
-  }[];
-  unnamed_processes_checked?: boolean;
-  unnamed_processes_killed?: number;
-  unnamed_processes_still_alive?: number[];
-  unconfirmed_because?: string;
-  sessions_not_read?: string[];
-  note?: string;
-};
-
-/**
- * Whether a sweep read the kernel, and what it found — rendered only from the fields that are
- * actually there.
- *
- * An absent field means agentd declined to claim anything, and it has to stay absent here. A
- * missing `processes_checked` rendered as "checked no" would invent a failure, and rendered as
- * "checked yes" would be bug AE's sentence with the numbers filled in. Mirrors
- * `Sweep::checked`'s own convention: no field rather than a convenient one.
- */
-function sweepClause(checked?: boolean, killed?: number, alive?: number[]): string {
-  const bits: string[] = [];
-  if (typeof checked === "boolean") bits.push(`checked ${checked ? "yes" : "no"}`);
-  if (typeof killed === "number") bits.push(`killed ${killed}`);
-  if (Array.isArray(alive)) bits.push(`still alive ${alive.length ? alive.join(", ") : "none"}`);
-  return bits.join(", ");
-}
-
-/**
- * The text a `stop_job` answer reaches the chat as.
- *
- * **This is the only copy of that evidence anyone sees, which is why it is a named function with
- * a test of its own.** #2867 landed on the condition that an unconfirmed sweep's cause and its
- * skipped session ids reach an observer, and it did not: this renderer was `${states}. ${note}`,
- * so `unconfirmed_because`, `sessions_not_read`, `processes_checked` and the `unnamed_*` fields
- * were dropped here, before the chat row, the offloaded tool-output blob, the relay audit trail
- * or `.arbos/audit.jsonl` could carry any of them. agentd's struct was right the whole time and
- * a struct-level test said so, which is exactly how the gap shipped.
- *
- * So the fields go into the text the model reads. The `note` still leads, because it is the
- * sentence agentd wrote for the model to act on; the evidence follows it, for the model to
- * repeat and for a canary to match on.
- */
-export function stopJobText(result: StopJobResult | undefined): string {
-  const stopped = result?.stopped ?? [];
-  const states = stopped
-    .map((j) => {
-      const sweep = sweepClause(j.processes_checked, j.processes_killed, j.processes_still_alive);
-      return `${j.title ?? j.job_id} — state ${j.state ?? "unknown"}${sweep ? ` (processes ${sweep})` : ""}`;
-    })
-    .join("; ") || "nothing";
-  const parts = [`${states}.`, result?.note ?? ""];
-  if (result?.unconfirmed_because) {
-    const sessions = result.sessions_not_read ?? [];
-    const named = sessions.length ? `; sessions not read: ${sessions.join(", ")}` : "";
-    parts.push(`Unconfirmed because: ${result.unconfirmed_because}${named}.`);
-  }
-  const unnamed = sweepClause(
-    result?.unnamed_processes_checked,
-    result?.unnamed_processes_killed,
-    result?.unnamed_processes_still_alive,
-  );
-  if (unnamed) parts.push(`Work belonging to no job row: ${unnamed}.`);
-  return parts.map((p) => p.trim()).filter(Boolean).join(" ");
-}
 // Mirrors `arbos_core::approval::SHELL_TOOLS`; the classification itself happens in agentd.
 const SHELL_TOOLS = new Set(["bash", "shell", "run_command", "execute_command"]);
 const APPROVAL_POLL_MS = Number(process.env.ARBOS_APPROVAL_POLL_MS ?? 1500);
@@ -202,11 +134,6 @@ const PI_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find
 const STABLE_PREFIX = (process.env.ARBOS_STABLE_PREFIX ?? "off").trim().toLowerCase() === "on";
 const CONTEXT_OPEN = "[Arbos context for this turn — working set, skills, project memory. Not from the user.]";
 const CONTEXT_CLOSE = "[End of Arbos context]";
-
-// `expired` is legacy: agentd stopped producing it when cards stopped expiring, but a stored row
-// from before that can still carry it. `cancelled` is a card closed because the work was called
-// off.
-type ApprovalState = "allowed" | "pending" | "approved" | "rejected" | "expired" | "cancelled";
 
 type HookResponse = { ok: boolean; error?: string; terminate?: boolean; text?: string; [k: string]: unknown };
 
@@ -366,7 +293,6 @@ export default function arbosPiExt(pi: ExtensionAPI) {
       call_id: event.toolCallId,
       parent,
       input_hash: inputHash(event.input),
-      input_preview: JSON.stringify(event.input).slice(0, 200),
       denied:
         denied?.rule ??
         (directOnly ? "direct-only-from-script" : null) ??
@@ -471,67 +397,31 @@ export default function arbosPiExt(pi: ExtensionAPI) {
     input: unknown,
     callId: string,
   ): Promise<{ block: true; reason: string } | undefined> {
-    const first = await hook("/hook/approval", { tool, input, session_id: sessionId, role: SESSION_ROLE });
-    if (!first) return undefined; // no agentd: local pi runs are not gated
-    if (!first.ok) {
-      audit({ kind: "approval_error", session: sessionId, tool, call_id: callId, error: first.error ?? null });
-      return undefined;
-    }
-    let state = String(first.state ?? "allowed") as ApprovalState;
-    if (state === "allowed") return undefined;
-    const approvalId = String(first.approvalId ?? "");
-    audit({ kind: "approval_wait", session: sessionId, tool, call_id: callId, approval_id: approvalId, title: first.title ?? null });
-    const waitMs = typeof first.waitMs === "number" && first.waitMs > 0 ? first.waitMs : APPROVAL_WAIT_MS;
-    const deadline = Date.now() + waitMs;
-    let reason: string | undefined;
-    while (state === "pending" && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, APPROVAL_POLL_MS));
-      const cur = await hook("/hook/approval-status", { approvalId });
-      if (cur?.ok && typeof cur.state === "string") {
-        state = cur.state as ApprovalState;
-        if (typeof cur.reason === "string") reason = cur.reason;
-      }
-    }
-    if (state === "pending") {
-      // Nobody answered inside the grace, so stop holding things: a main-session call is
-      // holding the chat's turn, and a worker is holding a slot, a child process and an open
-      // job. The card stays answerable — it has no deadline — and agentd runs the call itself
-      // once it is approved, so this is a park rather than a failure. Holding on for the whole
-      // wait is Test5 round 5 bug R: fourteen minutes in which that chat could only answer from
-      // the quick lane, and the card was then closed unanswered.
-      const parked = await hook("/hook/approval-park", { approvalId });
-      if (parked?.ok && parked.parked === true) {
-        audit({ kind: "approval_parked", session: sessionId, tool, call_id: callId, approval_id: approvalId });
-        return { block: true, reason: String(parked.reason ?? "This needs the user's approval; nothing ran.") };
-      }
-      // Decided inside the grace, or already gone: fall through on the state agentd reports.
-      if (typeof parked?.state === "string") state = parked.state as ApprovalState;
-    }
-    audit({ kind: "approval_result", session: sessionId, tool, call_id: callId, approval_id: approvalId, state });
-    switch (state) {
-      case "allowed":
-      case "approved":
-        return undefined;
-      case "rejected":
-        return {
-          block: true,
-          reason: `The user rejected this action (approval ${approvalId})${reason ? `: ${reason}` : ""}. Do not retry it unchanged; tell the user.`,
-        };
-      case "cancelled":
-        return {
-          block: true,
-          reason: `This work was cancelled, so its approval card (${approvalId}) was closed and nothing ran. Whatever it was meant to post, send or change is NOT done.`,
-        };
-      case "expired":
-      case "pending":
-        return {
-          block: true,
-          reason: `Nothing ran: this needs the user's approval and card ${approvalId} is waiting for them. Do not call it again and do not wait for it — say in one short sentence that it needs their approval, then end your turn. When they approve, Arbos runs the call and gives you the result. Whatever it was meant to post, send or change is NOT done yet; never say it was posted or sent.`,
-        };
-      default: {
-        const _exhaustive: never = state;
-        return { block: true, reason: `Unknown approval state ${String(_exhaustive)}` };
-      }
+    if (!HOOK_URL) return undefined; // Explicit standalone configuration; a failed configured hook never reaches this branch.
+    try {
+      const { checkApproval, approvalVerdict } = await import("./approval.ts");
+      const state = await checkApproval({
+        hookUrl: HOOK_URL,
+        token: HOOK_TOKEN,
+        body: { tool, input, session_id: sessionId, role: SESSION_ROLE },
+        pollMs: APPROVAL_POLL_MS,
+        fallbackWaitMs: APPROVAL_WAIT_MS,
+        onTransition(state) {
+          const base = { session: sessionId, tool, call_id: callId };
+          switch (state._tag) {
+            case "Pending": audit({ kind: "approval_wait", ...base, approval_id: state.approvalId }); break;
+            case "Parked": audit({ kind: "approval_parked", ...base, approval_id: state.approvalId }); break;
+            case "Failed": audit({ kind: "approval_error", ...base, error: state.failure._tag }); break;
+            case "Denied": audit({ kind: "approval_result", ...base, approval_id: state.approvalId, state: state.decision }); break;
+            case "BlockedPending": audit({ kind: "approval_result", ...base, approval_id: state.approvalId, state: "pending" }); break;
+            case "Allowed": if (state.source === "approved") audit({ kind: "approval_result", ...base, approval_id: state.approvalId, state: "approved" }); break;
+          }
+        },
+      });
+      return approvalVerdict(state);
+    } catch {
+      audit({ kind: "approval_error", session: sessionId, tool, call_id: callId, error: "ApprovalUnavailable" });
+      return { block: true, reason: "Nothing ran: approval could not be checked. Do not bypass approval; try again when the service is available." };
     }
   }
 
