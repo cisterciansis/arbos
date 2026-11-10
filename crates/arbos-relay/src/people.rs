@@ -7,6 +7,8 @@
 //! pushes per person per minute across people rooms, 50 new chats per person per day (both
 //! halved for accounts under seven days old).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,7 +29,9 @@ use arbos_core::wire;
 
 use crate::auth::Principal;
 use crate::blobs::{no_such_image, not_an_image, stored_image, StoredImage};
-use crate::db_people::{ChatWithMembers, GroupInvite, Invite, Membership, PeopleChat};
+use crate::db_people::{
+    ChatWithMembers, GroupInvite, Invite, MemberProject, Membership, PeopleChat, UserPresence,
+};
 use crate::notices;
 use crate::signin::api_error;
 use crate::state::AppState;
@@ -132,14 +136,10 @@ fn rate_limited(retry_s: i64) -> Response {
 
 /// May `adder` put `target` into a people group under the target's `group_add` privacy?
 fn may_add_to_group(state: &AppState, adder: &str, target: &str) -> bool {
-    let policy = state
-        .db
-        .group_add_policy(target)
-        .unwrap_or_else(|_| "anyone".into());
-    match policy.as_str() {
-        "nobody" => false,
-        "people_i_know" => state.db.dm_between(adder, target).ok().flatten().is_some(),
-        _ => true, // anyone (default)
+    match state.db.group_add_policy(target).as_deref() {
+        Ok("anyone") => true,
+        Ok("people_i_know") => state.db.dm_between(adder, target).ok().flatten().is_some(),
+        _ => false,
     }
 }
 
@@ -270,12 +270,131 @@ pub fn with_presence(state: &AppState, mut card: UserCardDto) -> UserCardDto {
     card
 }
 
-#[allow(dead_code)] // helper kept for wire/fixture tests; people_chat_dto uses member_dto
-pub(crate) fn member_json(state: &AppState, m: &Membership) -> Value {
-    serde_json::to_value(member_dto(state, m)).expect("ChatMemberDto")
+#[derive(Default)]
+struct MemberProfiles {
+    users: HashMap<String, UserPresence>,
+    projects: HashMap<String, MemberProject>,
+}
+
+impl MemberProfiles {
+    fn load<'a>(state: &AppState, members: impl Iterator<Item = &'a Membership>) -> Self {
+        let members: Vec<_> = members.collect();
+        let project_ids: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.project_id())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let projects = state.db.member_projects(&project_ids).unwrap_or_else(|_| {
+            project_ids
+                .into_iter()
+                .filter_map(|key| {
+                    state
+                        .db
+                        .project(&key)
+                        .ok()
+                        .flatten()
+                        .map(|project| (key, MemberProject::from(project)))
+                })
+                .collect()
+        });
+        let user_ids: Vec<_> = members
+            .iter()
+            .filter_map(|m| m.user_id())
+            .chain(projects.values().map(|p| p.user_id.as_str()))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let users = state.db.user_presence(&user_ids).unwrap_or_else(|_| {
+            user_ids
+                .into_iter()
+                .map(|id| {
+                    let profile = UserPresence {
+                        card: state.db.user_card(&id).ok().flatten(),
+                        seen: state.db.user_last_seen(&id).ok().flatten(),
+                    };
+                    (id, profile)
+                })
+                .collect()
+        });
+        Self { users, projects }
+    }
+
+    fn card(&self, id: &str) -> Option<&UserCardDto> {
+        self.users.get(id)?.card.as_ref()
+    }
+    fn seen(&self, id: &str) -> Option<i64> {
+        self.users.get(id)?.seen
+    }
+
+    fn owner(&self, id: &str) -> arbos_core::api::ProjectOwnerDto {
+        let sender =
+            crate::notify::Sender::from_user_card(id, self.card(id).cloned().unwrap_or_default());
+        crate::api::project_owner_from_sender(id, sender, self.seen(id))
+    }
+}
+
+struct ChatProfiles {
+    members: MemberProfiles,
+    banned: HashMap<String, Vec<Membership>>,
+    blocked: HashSet<String>,
+}
+
+impl ChatProfiles {
+    fn load(state: &AppState, chats: &[&ChatWithMembers], me: &str) -> Self {
+        let banned: HashMap<_, _> = chats
+            .iter()
+            .filter(|cm| {
+                cm.members.iter().any(|m| {
+                    m.user_id() == Some(me)
+                        && (m.role == "owner" || (m.role == "admin" && member_can_mute_ban(m)))
+                })
+            })
+            .map(|cm| {
+                (
+                    cm.chat.id.clone(),
+                    state.db.banned_members_of(&cm.chat.id).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let members = MemberProfiles::load(
+            state,
+            chats
+                .iter()
+                .flat_map(|cm| cm.members.iter())
+                .chain(banned.values().flatten().filter(|m| m.user_id().is_some())),
+        );
+        let ids: Vec<_> = chats
+            .iter()
+            .flat_map(|cm| human_user_ids(cm))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let blocked = state.db.blocked_roster_users(me, &ids).unwrap_or_else(|_| {
+            ids.into_iter()
+                .filter(|id| state.db.blocks(me, id).unwrap_or(false))
+                .collect()
+        });
+        Self {
+            members,
+            banned,
+            blocked,
+        }
+    }
 }
 
 pub(crate) fn member_dto(state: &AppState, m: &Membership) -> ChatMemberDto {
+    let profiles = MemberProfiles::load(state, std::iter::once(m));
+    member_dto_with_profiles(state, m, &profiles)
+}
+
+fn member_dto_with_profiles(
+    state: &AppState,
+    m: &Membership,
+    profiles: &MemberProfiles,
+) -> ChatMemberDto {
     let mut dto = ChatMemberDto {
         member: m.member.clone(),
         role: m.role.clone(),
@@ -305,15 +424,15 @@ pub(crate) fn member_dto(state: &AppState, m: &Membership) -> ChatMemberDto {
         settings: None,
     };
     if let Some(uid) = m.user_id() {
-        if let Ok(Some(card)) = state.db.user_card(uid) {
-            dto.handle = Some(card.handle);
+        if let Some(card) = profiles.card(uid) {
+            dto.handle = Some(card.handle.clone());
             // Always present for humans (null or string).
-            dto.avatar_url = Some(card.avatar_url);
-            dto.name = Some(card.name);
-            dto.status = Some(card.status);
+            dto.avatar_url = Some(card.avatar_url.clone());
+            dto.name = Some(card.name.clone());
+            dto.status = Some(card.status.clone());
         }
         dto.user_id = Some(uid.to_owned());
-        let seen = state.db.user_last_seen(uid).ok().flatten();
+        let seen = profiles.seen(uid);
         dto.last_seen_at = Some(seen.map(|t| t - t % 60_000));
         dto.online = Some(seen.is_some_and(|t| now_ms() - t < ONLINE_MS));
         dto.avatar_color_index_effective = Some(i64::from(crate::avatar::color_index(uid)));
@@ -333,7 +452,7 @@ pub(crate) fn member_dto(state: &AppState, m: &Membership) -> ChatMemberDto {
         }
     }
     if let Some(pid) = m.project_id() {
-        if let Ok(Some(p)) = state.db.project(pid) {
+        if let Some(p) = profiles.projects.get(pid) {
             dto.handle = Some(agent_slug(&p.name));
             let avatar = p
                 .avatar
@@ -348,7 +467,7 @@ pub(crate) fn member_dto(state: &AppState, m: &Membership) -> ChatMemberDto {
             ));
             dto.avatar = Some(avatar.clone());
             dto.avatar_color = Some(avatar_color.clone());
-            let disc_color = crate::avatar::effective_disc(&p);
+            let disc_color = crate::avatar::effective_disc_for(&p.id, p.avatar_leaf_color);
             dto.avatar_color_index = Some(p.avatar_color_index);
             dto.avatar_color_index_effective = Some(effective);
             dto.avatar_disc_color = Some(p.avatar_leaf_color);
@@ -373,18 +492,11 @@ pub(crate) fn member_dto(state: &AppState, m: &Membership) -> ChatMemberDto {
                     .and_then(|m| m.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                owner: crate::api::project_owner_dto(state, &p.user_id),
+                owner: profiles.owner(&p.user_id),
             });
             dto.description = Some(p.description.clone());
             dto.owner = Some(p.user_id.clone());
-            dto.owner_handle = Some(
-                state
-                    .db
-                    .user_card(&p.user_id)
-                    .ok()
-                    .flatten()
-                    .map(|c| c.handle),
-            );
+            dto.owner_handle = Some(profiles.card(&p.user_id).map(|c| c.handle.clone()));
         }
         dto.settings = Some(if m.settings.is_object() {
             m.settings.clone()
@@ -464,15 +576,6 @@ pub fn rename_agents_that_shadow_people(state: &AppState) {
     }
 }
 
-/// Soft-deleted agents leave every list at once; do not linger as @mention ghosts that
-/// never wake (workspace already moved to `/work/.archive/`). Humans always pass.
-fn member_alive(state: &AppState, m: &Membership) -> bool {
-    match m.project_id() {
-        None => true,
-        Some(pid) => state.db.project(pid).ok().flatten().is_some(),
-    }
-}
-
 pub fn chat_json(state: &AppState, cm: &ChatWithMembers, me: &str, device_id: &str) -> Value {
     serde_json::to_value(people_chat_dto(state, cm, me, device_id)).expect("PeopleChatDto")
 }
@@ -482,6 +585,17 @@ pub fn people_chat_dto(
     cm: &ChatWithMembers,
     me: &str,
     device_id: &str,
+) -> PeopleChatDto {
+    let profiles = ChatProfiles::load(state, &[cm], me);
+    people_chat_dto_with_profiles(state, cm, me, device_id, &profiles)
+}
+
+fn people_chat_dto_with_profiles(
+    state: &AppState,
+    cm: &ChatWithMembers,
+    me: &str,
+    device_id: &str,
+    profiles: &ChatProfiles,
 ) -> PeopleChatDto {
     let (head_seq, last_row_at) = state
         .db
@@ -505,9 +619,15 @@ pub fn people_chat_dto(
     let live: Vec<&Membership> = cm
         .members
         .iter()
-        .filter(|m| member_alive(state, m))
+        .filter(|m| {
+            m.project_id()
+                .is_none_or(|pid| profiles.members.projects.contains_key(pid))
+        })
         .collect();
-    let members: Vec<ChatMemberDto> = live.iter().map(|m| member_dto(state, m)).collect();
+    let members: Vec<ChatMemberDto> = live
+        .iter()
+        .map(|m| member_dto_with_profiles(state, m, &profiles.members))
+        .collect();
     let others: Vec<&ChatMemberDto> = members
         .iter()
         .filter(|m| m.member.starts_with("user:") && m.member != format!("user:{me}"))
@@ -542,20 +662,14 @@ pub fn people_chat_dto(
     let has_agent = live.iter().any(|m| m.project_id().is_some());
     let mine = live.iter().find(|m| m.user_id() == Some(me)).copied();
     let archived_at = state.db.chat_archived_at(me, &cm.chat.id).ok().flatten();
-    let can_see_banned =
-        mine.is_some_and(|m| m.role == "owner" || (m.role == "admin" && member_can_mute_ban(m)));
-    let banned = if can_see_banned {
-        state
-            .db
-            .banned_members_of(&cm.chat.id)
-            .unwrap_or_default()
-            .iter()
-            .filter(|m| m.user_id().is_some())
-            .map(|m| member_dto(state, m))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let banned = profiles
+        .banned
+        .get(&cm.chat.id)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.user_id().is_some())
+        .map(|m| member_dto_with_profiles(state, m, &profiles.members))
+        .collect();
     PeopleChatDto {
         id: cm.chat.id.clone(),
         archived_at,
@@ -587,7 +701,7 @@ pub fn people_chat_dto(
         // Members this viewer blocked: their rows are theirs to hide (groups), as `user:<id>`.
         blocked_senders: human_user_ids(cm)
             .into_iter()
-            .filter(|u| u != me && state.db.blocks(me, u).unwrap_or(false))
+            .filter(|u| u != me && profiles.blocked.contains(u))
             .map(|u| format!("user:{u}"))
             .collect(),
         lock_state: if has_agent {
@@ -1151,7 +1265,7 @@ pub async fn chats_list(State(state): State<AppState>, principal: Principal) -> 
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "db", e.to_string()),
     };
-    let mut out: Vec<Value> = chats
+    let visible: Vec<_> = chats
         .iter()
         .filter(|cm| {
             !state
@@ -1160,7 +1274,16 @@ pub async fn chats_list(State(state): State<AppState>, principal: Principal) -> 
                 .map(|(_, hidden)| hidden)
                 .unwrap_or(false)
         })
-        .map(|cm| chat_json(&state, cm, &me, &device))
+        .collect();
+    let profiles = ChatProfiles::load(&state, &visible, &me);
+    let mut out: Vec<Value> = visible
+        .into_iter()
+        .map(|cm| {
+            serde_json::to_value(people_chat_dto_with_profiles(
+                &state, cm, &me, &device, &profiles,
+            ))
+            .expect("PeopleChatDto")
+        })
         .collect();
     out.sort_by_key(|c| std::cmp::Reverse(c["last_activity_at"].as_i64().unwrap_or(0)));
     Json(out).into_response()
@@ -5492,6 +5615,248 @@ mod membership_notice_tests {
 }
 
 #[cfg(test)]
+mod roster_batch_tests {
+    use super::tests_support::{dm, group, person, project_of};
+    use super::*;
+    use crate::state::test_support::test_state;
+    use crate::state::AuthMode;
+
+    async fn json_response(response: Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_matches_detail_json_with_read_state_and_visibility_boundaries() {
+        let state = test_state(AuthMode::Github);
+        let (alice, dev) = person(&state, 91);
+        let (bob, _) = person(&state, 92);
+        let (carol, _) = person(&state, 93);
+        let (dave, _) = person(&state, 94);
+        let visible = group(&state, &[&alice, &bob, &carol, &dave]);
+        let direct = dm(&state, &alice, &bob);
+        let hidden = group(&state, &[&alice, &bob]);
+        let deleted = group(&state, &[&alice, &bob]);
+        let left = group(&state, &[&alice, &bob]);
+        let foreign = group(&state, &[&bob, &carol]);
+        state
+            .db
+            .set_hidden(&hidden, &device_of(&dev), true)
+            .unwrap();
+        state
+            .db
+            .set_hidden(&direct, "another-device", true)
+            .unwrap();
+        state
+            .db
+            .with(|c| {
+                c.execute(
+                    "UPDATE people_chats SET deleted_at=1 WHERE id=?1",
+                    rusqlite::params![deleted],
+                )
+            })
+            .unwrap();
+        state
+            .db
+            .remove_member(&left, &format!("user:{alice}"), false)
+            .unwrap();
+        state
+            .db
+            .remove_member(&visible, &format!("user:{carol}"), false)
+            .unwrap();
+        state
+            .db
+            .remove_member(&visible, &format!("user:{dave}"), true)
+            .unwrap();
+        for name in ["Zed", "Ada"] {
+            let project = project_of(&state, &alice, name);
+            state
+                .db
+                .add_member(
+                    &visible,
+                    &format!("agent:{project}"),
+                    "agent",
+                    &alice,
+                    &json!({}),
+                )
+                .unwrap();
+        }
+        state
+            .db
+            .set_member_settings(
+                &visible,
+                &format!("user:{alice}"),
+                &json!({"nested":["é",true,null]}),
+            )
+            .unwrap();
+        state
+            .db
+            .set_member_muted(&visible, &format!("user:{bob}"), true)
+            .unwrap();
+        state
+            .db
+            .set_member_silenced(&visible, &format!("user:{bob}"), true, Some(i64::MAX))
+            .unwrap();
+        for n in 0..3 {
+            state
+                .db
+                .append_row(
+                    &room_of(&visible),
+                    "test-device",
+                    &format!("row-{n}"),
+                    b"fixture",
+                )
+                .unwrap();
+        }
+        state
+            .db
+            .set_read_mark(&visible, &device_of(&dev), 1)
+            .unwrap();
+        state.db.advance_user_cursor(&alice, &visible, 2).unwrap();
+
+        let list = json_response(chats_list(State(state.clone()), dev.clone()).await).await;
+        let entries = list.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for id in [&visible, &direct] {
+            let listed = entries.iter().find(|value| value["id"] == *id).unwrap();
+            let detail =
+                json_response(chat_get(State(state.clone()), dev.clone(), Path(id.clone())).await)
+                    .await;
+            assert_eq!(*listed, detail, "list and individual-room DTO must agree");
+        }
+        let listed = entries.iter().find(|value| value["id"] == visible).unwrap();
+        assert_eq!(listed["read_seq"], 2);
+        assert_eq!(listed["head_seq"], 3);
+        assert_eq!(listed["members"].as_array().unwrap().len(), 4);
+        assert_eq!(listed["banned"].as_array().unwrap().len(), 1);
+        for id in [&hidden, &deleted, &left, &foreign] {
+            assert!(!entries.iter().any(|value| value["id"] == *id));
+        }
+    }
+    #[tokio::test]
+    async fn list_profile_work_does_not_query_once_per_member() {
+        std::thread_local! {
+            static STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        unsafe extern "C" fn count_statement(
+            kind: u32,
+            _context: *mut std::ffi::c_void,
+            _statement: *mut std::ffi::c_void,
+            _sql: *mut std::ffi::c_void,
+        ) -> i32 {
+            if kind == rusqlite::ffi::SQLITE_TRACE_STMT as u32 {
+                let _ = STATEMENTS.try_with(|count| count.set(count.get().saturating_add(1)));
+            }
+            0
+        }
+        let mut observed = Vec::new();
+        for humans in [2, 24] {
+            let state = test_state(AuthMode::Github);
+            let users = (0..humans)
+                .map(|n| person(&state, 5000 + n))
+                .collect::<Vec<_>>();
+            let viewer = &users[0].0;
+            let device = users[0].1.clone();
+            let members = users.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+            let projects = (0..2)
+                .map(|n| project_of(&state, viewer, &format!("Budget agent {n}")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                state
+                    .db
+                    .member_projects(&projects)
+                    .expect("batch project SQL")
+                    .len(),
+                projects.len()
+            );
+            let mut rooms = Vec::new();
+            for _ in 0..8 {
+                let room = group(&state, &members);
+                for project in &projects {
+                    state
+                        .db
+                        .add_member(
+                            &room,
+                            &format!("agent:{project}"),
+                            "agent",
+                            viewer,
+                            &json!({}),
+                        )
+                        .unwrap();
+                }
+                rooms.push(room);
+            }
+            STATEMENTS.with(|count| count.set(0));
+            state
+                .db
+                .with(|connection| {
+                    // SAFETY: Db owns/locks the connection; callback has no SQL calls or context pointer.
+                    let result = unsafe {
+                        rusqlite::ffi::sqlite3_trace_v2(
+                            connection.handle(),
+                            rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+                            Some(count_statement),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+                    Ok(())
+                })
+                .unwrap();
+            let response = chats_list(State(state.clone()), device.clone()).await;
+            state
+                .db
+                .with(|connection| {
+                    // SAFETY: remove the no-context callback while the connection remains owned/locked.
+                    let result = unsafe {
+                        rusqlite::ffi::sqlite3_trace_v2(
+                            connection.handle(),
+                            0,
+                            None,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+                    Ok(())
+                })
+                .unwrap();
+            let statements = STATEMENTS.with(std::cell::Cell::get);
+            let list = json_response(response).await;
+            let entries = list.as_array().unwrap();
+            assert_eq!(entries.len(), rooms.len());
+            for room in &rooms {
+                let listed = entries.iter().find(|entry| entry["id"] == *room).unwrap();
+                assert_eq!(
+                    listed["members"].as_array().unwrap().len(),
+                    humans as usize + projects.len()
+                );
+                let detail = json_response(
+                    chat_get(State(state.clone()), device.clone(), Path(room.clone())).await,
+                )
+                .await;
+                assert_eq!(
+                    *listed, detail,
+                    "batched list must preserve the complete detail DTO"
+                );
+            }
+            observed.push((humans, statements));
+        }
+        eprintln!("whole chat-list SQLite statement counts: {observed:?}");
+        assert!(
+            observed.iter().all(|(_, count)| *count <= 80),
+            "bounded per-request profile/relationship reads: {observed:?}"
+        );
+        assert!(
+            observed[1].1 <= observed[0].1 + 8,
+            "profile work must not grow once per member: {observed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod read_cursor_tests {
     //! #1438: one read cursor per user. A chat is unread only for announced messages someone
     //! else wrote after the user's read mark — never for the user's own rows (from any of their
@@ -6036,6 +6401,138 @@ mod group_add_privacy_tests {
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
+    }
+    #[derive(Clone, Copy)]
+    enum AddPath {
+        CreateGroup,
+        AddMember,
+        ShareProject,
+        Invite,
+    }
+
+    async fn assert_unreadable_policy_refuses(path: AddPath, invalid_policy: bool) {
+        let state = test_state(AuthMode::Github);
+        let (alice, alice_dev) = person(&state, 71);
+        let (bob, _) = person(&state, 72);
+        let project = project_of(&state, &alice, "Shared");
+        let group = super::tests_support::group(&state, &[&alice]);
+        state.db.set_group_add_policy(&bob, "nobody").unwrap();
+        let before_chats = state
+            .db
+            .chats_of_member(&format!("user:{alice}"))
+            .unwrap()
+            .len();
+        let before_invites: i64 = state
+            .db
+            .with(|c| c.query_row("SELECT COUNT(*) FROM invites", [], |r| r.get(0)))
+            .unwrap();
+        if invalid_policy {
+            // A corrupt/unknown stored policy is not the documented open default.
+            state.db.set_group_add_policy(&bob, "unrecognized").unwrap();
+        } else {
+            // Keep user lookups and membership tables usable while the policy read fails.
+            state
+                .db
+                .with(|c| {
+                    c.execute_batch(
+                        "ALTER TABLE users RENAME COLUMN group_add TO unavailable_group_add",
+                    )
+                })
+                .unwrap();
+            assert!(state.db.group_add_policy(&bob).is_err());
+            assert!(state.db.user(&bob).unwrap().is_some());
+        }
+        let response = match path {
+            AddPath::CreateGroup => {
+                chats_create_group(
+                    State(state.clone()),
+                    alice_dev,
+                    Json(CreateGroupBody {
+                        kind: "group".into(),
+                        members: vec!["user72".into()],
+                        agent_ids: vec![],
+                        title: Some("Refused".into()),
+                        avatar_disc_color: None,
+                        description: None,
+                    }),
+                )
+                .await
+            }
+            AddPath::AddMember => {
+                member_add(
+                    State(state.clone()),
+                    alice_dev,
+                    Path(group.clone()),
+                    Json(AddMemberBody {
+                        handle: Some("user72".into()),
+                        handles: vec![],
+                        agent_ids: vec![],
+                    }),
+                )
+                .await
+            }
+            AddPath::ShareProject => share(&state, &alice_dev, &project, "user72").await,
+            AddPath::Invite => invite_into(&state, &alice_dev, &project, "user72").await,
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {"type": "not_available", "message": "this person is not available"}})
+        );
+        assert!(!state.db.is_project_member(&project, &bob).unwrap());
+        assert!(!state
+            .db
+            .members_of(&group)
+            .unwrap()
+            .iter()
+            .any(|m| m.member == format!("user:{bob}")));
+        assert_eq!(
+            state
+                .db
+                .chats_of_member(&format!("user:{alice}"))
+                .unwrap()
+                .len(),
+            before_chats
+        );
+        assert!(state
+            .db
+            .chats_of_member(&format!("user:{bob}"))
+            .unwrap()
+            .is_empty());
+        let after_invites: i64 = state
+            .db
+            .with(|c| c.query_row("SELECT COUNT(*) FROM invites", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(after_invites, before_invites);
+    }
+
+    #[tokio::test]
+    async fn policy_read_error_refuses_group_create_without_partial_writes() {
+        assert_unreadable_policy_refuses(AddPath::CreateGroup, false).await;
+    }
+
+    #[tokio::test]
+    async fn policy_read_error_refuses_member_add_without_partial_writes() {
+        assert_unreadable_policy_refuses(AddPath::AddMember, false).await;
+    }
+
+    #[tokio::test]
+    async fn policy_read_error_refuses_project_share_without_partial_writes() {
+        assert_unreadable_policy_refuses(AddPath::ShareProject, false).await;
+    }
+
+    #[tokio::test]
+    async fn policy_read_error_refuses_invite_without_partial_writes() {
+        assert_unreadable_policy_refuses(AddPath::Invite, false).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_policy_refuses_project_share() {
+        assert_unreadable_policy_refuses(AddPath::ShareProject, true).await;
     }
 }
 

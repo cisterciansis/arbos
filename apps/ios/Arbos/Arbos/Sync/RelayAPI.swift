@@ -78,10 +78,23 @@ struct RegistryResult {
     var incomplete: Bool
 }
 
+private enum RegistryDetail {
+    case project(RegistryProject)
+    case skipped(String)
+    case omitted
+}
+
 /// List rows from `GET /projects` may overwrite `owner` with a user-id string; that
 /// fails `ProjectDto` decoding, so we only need the id to fetch the detail.
 private struct ProjectListId: Decodable {
     var id: String
+}
+
+/// The bearer captured by this owned client's latest admitted request.
+@MainActor
+private final class CallAuthority {
+    var bearer: String
+    init(_ bearer: String) { self.bearer = bearer }
 }
 
 final class RelayAPI {
@@ -92,6 +105,8 @@ final class RelayAPI {
     var refresher: (() async -> Bool)?
 
     private let session: URLSession
+    private var authorization: (@MainActor () -> String?)?
+    private var cleanupAuthority: CallAuthority?
 
     init(endpoint: RelayEndpoint, token: @escaping () -> String) {
         self.endpoint = endpoint
@@ -100,6 +115,55 @@ final class RelayAPI {
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         session = URLSession(configuration: config)
+    }
+
+    private init(endpoint: RelayEndpoint, token: @escaping () -> String, session: URLSession) {
+        self.endpoint = endpoint
+        self.token = token
+        self.session = session
+    }
+
+    /// Preserve refresh within one local account lifetime. The guard is also
+    /// checked immediately before each request, including a refreshed retry.
+    @MainActor
+    func bound(to isCurrent: @escaping @MainActor () -> Bool) -> RelayAPI {
+        let sourceToken = token
+        let sourceAuthorization = authorization
+        let refresh = refresher
+        let captured = CallAuthority(sourceAuthorization.map { $0() ?? "" } ?? sourceToken())
+        let api = RelayAPI(endpoint: endpoint, token: sourceToken, session: session)
+        api.cleanupAuthority = captured
+        api.authorization = {
+            guard isCurrent() else { return nil }
+            let bearer: String
+            if let sourceAuthorization {
+                guard let current = sourceAuthorization() else { return nil }
+                bearer = current
+            } else { bearer = sourceToken() }
+            captured.bearer = bearer
+            return bearer
+        }
+        api.refresher = { @MainActor in
+            guard isCurrent(), let refresh else { return false }
+            let renewed = await refresh()
+            return isCurrent() && renewed
+        }
+        return api
+    }
+
+    /// Best-effort cleanup for abandoned work uses its original bearer only.
+    /// It shares transport and the original owner's admitted bearer updates,
+    /// never a replacement account or a cleanup-triggered refresh.
+    @MainActor
+    func frozenAuthority() -> RelayAPI {
+        let bearer = authorization.map { $0() ?? "" } ?? token()
+        let api = RelayAPI(endpoint: endpoint, token: { bearer }, session: session)
+        if let cleanupAuthority {
+            // Only the original bound client's guarded admissions can update it.
+            // A successful refresh remains usable after the account is retired.
+            api.authorization = { cleanupAuthority.bearer }
+        }
+        return api
     }
 
     // MARK: Raw calls
@@ -124,6 +188,17 @@ final class RelayAPI {
         }
     }
 
+    /// JSON and raw-body requests share the same account admission boundary.
+    /// Keep the returned bearer fixed for the request after its MainActor check.
+    private func requestBearer(auth: Bool = true) async throws -> String {
+        if let authorization {
+            // Admission and dynamic token capture share one MainActor turn.
+            guard let allowed = await authorization() else { throw CancellationError() }
+            return allowed
+        }
+        return auth ? token() : ""
+    }
+
     private func requestOnce(_ method: String, _ path: String, body: Any?, auth: Bool, headers: [String: String] = [:], timeout: TimeInterval? = nil) async throws -> (Data, HTTPURLResponse) {
         guard let url = URL(string: endpoint.httpUrl + path) else {
             throw RelayError(status: 0, message: "Bad relay URL")
@@ -131,9 +206,8 @@ final class RelayAPI {
         var req = URLRequest(url: url)
         req.httpMethod = method
         if let timeout { req.timeoutInterval = timeout }
-        if auth {
-            req.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
-        }
+        let bearer = try await requestBearer(auth: auth)
+        if auth { req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
         // What runs here (`ios/1.0.0 (202610192230)`): the relay's "installed version" signal for
         // continuous delivery (GET /admin/installs), on every call.
         req.setValue(Self.clientHeader, forHTTPHeaderField: "X-Arbos-Client")
@@ -264,8 +338,7 @@ final class RelayAPI {
         guard let list = try await json("GET", "/projects") as? [Any] else {
             return RegistryResult(projects: [], skippedIds: [], incomplete: false)
         }
-        var out: [RegistryProject] = []
-        var skippedIds: Set<String> = []
+        var entries: [(id: String, archivedAt: Int64?)] = []
         var incomplete = false
         let decoder = JSONDecoder()
         for item in list {
@@ -274,60 +347,99 @@ final class RelayAPI {
                 incomplete = true
                 continue
             }
-            let id: String
             // The per-user archive flag rides on the list only; the detail is shared.
-            var listArchivedAt: Int64? = nil
             if let dto = try? decoder.decode(ProjectDto.self, from: itemData) {
-                id = dto.id
-                listArchivedAt = dto.archived_at.flatMap { $0 }
+                entries.append((dto.id, dto.archived_at.flatMap { $0 }))
             } else if let bare = try? decoder.decode(ProjectListId.self, from: itemData) {
-                id = bare.id
+                entries.append((bare.id, nil))
             } else {
                 NSLog("ProjectDto: bad list item")
                 incomplete = true
-                continue
             }
-            // A project the list shows but this user may not open (403) is an
-            // access answer, not a parse skip — leave it out of skippedIds.
-            let detailRaw: Any
-            do {
-                detailRaw = try await json("GET", "/projects/\(id)")
-            } catch let e as RelayError where e.status == 403 || e.status == 404 {
-                continue
-            }
-            guard JSONSerialization.isValidJSONObject(detailRaw),
-                  let detailData = try? JSONSerialization.data(withJSONObject: detailRaw) else {
-                skippedIds.insert(id)
-                continue
-            }
-            let detail: GetProjectResponseDto
-            do {
-                detail = try decoder.decode(GetProjectResponseDto.self, from: detailData)
-            } catch {
-                NSLog("GetProjectResponseDto: \(error)")
-                skippedIds.insert(id)
-                continue
-            }
-            var project = Arbos.Project(dto: detail.project)
-            project.archivedAt = listArchivedAt
-            project.imageURL = Arbos.Project.pictureURL(httpUrl: endpoint.httpUrl, id: id, imageKey: project.imageKey, version: project.avatarVersion)
-            // Prefer the detail's live box word when present (same as the old parse).
-            project.state = Arbos.BoxState.from(state: detail.project.state, box: detail.box)
-            project.stateSince = detail.box_since
-            // `models` is free-form JSON (skipped on the Dto); read talking model id + effort only.
-            if let detailMap = detailRaw as? [String: Any] {
-                let p = (detailMap["project"] as? [String: Any]) ?? [:]
-                let models = p["models"] as? [String: Any] ?? [:]
-                let talking = models["talking_model"] as? [String: Any] ?? [:]
-                if let modelId = talking["id"] as? String, !modelId.isEmpty {
-                    project.model = modelId
+        }
+        // Bound independent detail requests without letting completion order change
+        // list order or which fatal error is reported. Already-admitted GETs finish.
+        let results = await withTaskGroup(of: (Int, Result<RegistryDetail, Error>).self) { group in
+            var results = [Result<RegistryDetail, Error>?](repeating: nil, count: entries.count)
+            var next = min(4, entries.count)
+            var firstFailure = entries.count
+            for index in 0..<next {
+                let entry = entries[index]
+                group.addTask {
+                    do { return (index, .success(try await self.registryDetail(entry.id, archivedAt: entry.archivedAt))) }
+                    catch { return (index, .failure(error)) }
                 }
-                project.effort = Effort.from(talking["effort"] as? String)
             }
-            let chats = detail.chats.map { Arbos.Chat(dto: $0) }
-            out.append(RegistryProject(project: project, chats: chats))
+            while let (index, result) = await group.next() {
+                results[index] = result
+                if case .failure = result { firstFailure = min(firstFailure, index) }
+                if Task.isCancelled {
+                    group.cancelAll()
+                } else if next < entries.count, next < firstFailure {
+                    let index = next
+                    let entry = entries[index]
+                    next += 1
+                    group.addTask {
+                        do { return (index, .success(try await self.registryDetail(entry.id, archivedAt: entry.archivedAt))) }
+                        catch { return (index, .failure(error)) }
+                    }
+                }
+            }
+            return results
+        }
+        try Task.checkCancellation()
+        var out: [RegistryProject] = []
+        var skippedIds: Set<String> = []
+        for result in results {
+            guard let result else { throw CancellationError() }
+            switch try result.get() {
+            case .project(let project): out.append(project)
+            case .skipped(let id): skippedIds.insert(id)
+            case .omitted: break
+            }
         }
         return RegistryResult(projects: out, skippedIds: skippedIds, incomplete: incomplete)
+    }
+
+    private func registryDetail(_ id: String, archivedAt: Int64?) async throws -> RegistryDetail {
+        let decoder = JSONDecoder()
+        // A project the list shows but this user may not open (403) is an
+        // access answer, not a parse skip — leave it out of skippedIds.
+        let detailRaw: Any
+        do {
+            detailRaw = try await json("GET", "/projects/\(id)")
+        } catch let e as RelayError where e.status == 403 || e.status == 404 {
+            return .omitted
+        }
+        guard JSONSerialization.isValidJSONObject(detailRaw),
+              let detailData = try? JSONSerialization.data(withJSONObject: detailRaw) else {
+            return .skipped(id)
+        }
+        let detail: GetProjectResponseDto
+        do {
+            detail = try decoder.decode(GetProjectResponseDto.self, from: detailData)
+        } catch {
+            NSLog("GetProjectResponseDto: \(error)")
+            return .skipped(id)
+        }
+        var project = Arbos.Project(dto: detail.project)
+        project.archivedAt = archivedAt
+        project.imageURL = Arbos.Project.pictureURL(httpUrl: endpoint.httpUrl, id: id, imageKey: project.imageKey, version: project.avatarVersion)
+        // Prefer the detail's live box word when present (same as the old parse).
+        project.state = Arbos.BoxState.from(state: detail.project.state, box: detail.box)
+        project.stateSince = detail.box_since
+        // `models` is free-form JSON (skipped on the Dto); read talking model id + effort only.
+        if let detailMap = detailRaw as? [String: Any] {
+            let p = (detailMap["project"] as? [String: Any]) ?? [:]
+            let models = p["models"] as? [String: Any] ?? [:]
+            let talking = models["talking_model"] as? [String: Any] ?? [:]
+            if let modelId = talking["id"] as? String, !modelId.isEmpty {
+                project.model = modelId
+            }
+            project.effort = Effort.from(talking["effort"] as? String)
+        }
+        let chats = detail.chats.map { Arbos.Chat(dto: $0) }
+        return .project(RegistryProject(project: project, chats: chats))
     }
 
     static func parseChat(_ raw: Any) -> Arbos.Chat? {
@@ -633,7 +745,8 @@ final class RelayAPI {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
-        req.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
+        let bearer = try await requestBearer()
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.setValue(mime, forHTTPHeaderField: "Content-Type")
         req.httpBody = data
         let (body, response) = try await session.data(for: req)
@@ -652,7 +765,8 @@ final class RelayAPI {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
-        req.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
+        let bearer = try await requestBearer()
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.setValue(PictureMaster.mime(jpeg), forHTTPHeaderField: "Content-Type")
         req.httpBody = jpeg
         let (body, response) = try await session.data(for: req)
@@ -726,7 +840,8 @@ final class RelayAPI {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 60
-        req.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
+        let bearer = try await requestBearer()
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         if let projectId { req.setValue(projectId, forHTTPHeaderField: "X-Arbos-Project") }
         req.httpBody = body
@@ -1157,7 +1272,8 @@ final class RelayAPI {
             throw RelayError(status: 0, message: "Bad relay URL")
         }
         var req = URLRequest(url: url)
-        req.setValue("Bearer \(token())", forHTTPHeaderField: "Authorization")
+        let bearer = try await requestBearer()
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         let (body, response) = try await session.data(for: req)
         guard let http = response as? HTTPURLResponse, http.statusCode < 400 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
