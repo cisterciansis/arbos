@@ -157,7 +157,7 @@ final class MessageActionsLayoutTests: XCTestCase {
 
     /// The emoji keyboard on a small phone (iPhone SE: 667 pt, emoji keyboard 335 pt) with
     /// the longest menu: with the menu the group cannot fit and Delete ends under the
-    /// keyboard ([feedback iphone-emoji-picker-layout-2026-11-13]). With the picker open the
+    /// keyboard (tester report, 2026-11-13). With the picker open the
     /// menu is hidden, so the capsule and the bubble fit above the keyboard wherever the
     /// bubble was pressed — top, middle or bottom of the screen, short or tall.
     func testPickerOpenFitsCapsuleAndBubbleAboveTheEmojiKeyboard() {

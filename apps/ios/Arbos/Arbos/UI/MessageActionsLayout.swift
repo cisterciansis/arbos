@@ -18,7 +18,7 @@ import Foundation
 /// 6. The emoji keyboard is up (the capsule's add-emoji control) → the menu is hidden and
 ///    only the capsule and the bubble are fitted above the keyboard: a tall menu has no
 ///    room there and its last rows ended up under the keyboard
-///    ([feedback iphone-emoji-picker-layout-2026-11-13]).
+///    (tester report, 2026-11-13).
 struct MessageActionsLayout: Equatable {
     enum Placement: Equatable {
         /// Capsule · bubble · menu (top to bottom).
